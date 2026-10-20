@@ -1,175 +1,31 @@
-import os
-import glob
-import re
-import json
-import warnings
-import openpyxl
-import pandas as pd
-import gspread
-from google.oauth2.service_account import Credentials
+name: 외주공사 기성 구글시트 자동 적재 파이프라인
 
-warnings.filterwarnings('ignore', category=UserWarning, module='openpyxl')
+on:
+  push:
+    paths:
+      - 'data/**'
+  workflow_dispatch:
 
-def map_standard_job_category(job_str: str) -> str:
-    """
-    서류상 직종을 5대 표준 공종(배관공, 용접사, 관리자, 보통인부, 도비공)으로 정규화
-    - '보조' 포함 인원 -> 관리자
-    - 유도원, 화기 -> 보통인부
-    """
-    if not job_str:
-        return '기타'
-    job = str(job_str).strip()
-    if '보조' in job:
-        return '관리자'
-    elif '유도' in job or '화기' in job:
-        return '보통인부'
-    elif '배관' in job:
-        return '배관공'
-    elif '용접' in job:
-        return '용접사'
-    elif '도비' in job:
-        return '도비공'
-    elif '관리' in job:
-        return '관리자'
-    elif '보통' in job or '인부' in job:
-        return '보통인부'
-    return '기타'
+jobs:
+  build:
+    runs-on: ubuntu-latest
 
-def find_sheet(wb, candidate_names):
-    for name in wb.sheetnames:
-        for cand in candidate_names:
-            if cand.lower() in name.lower().replace(" ", ""):
-                return wb[name]
-    return None
+    steps:
+      - name: 저장소 체크아웃
+        uses: actions/checkout@v4
 
-def parse_single_billing_file(file_path: str) -> dict:
-    wb = openpyxl.load_workbook(file_path, data_only=True)
-    base_name = os.path.basename(file_path)
+      - name: 파이썬 환경 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-    round_no = None
-    billing_month = ""
-    match_round = re.search(r'(\d+)\s*회차', base_name)
-    if match_round:
-        round_no = int(match_round.group(1))
-    match_date = re.search(r'(\d{2})년\s*(\d{1,2})월', base_name)
-    if match_date:
-        billing_month = f"20{match_date.group(1)}-{int(match_date.group(2)):02d}"
+      - name: 필수 라이브러리 설치
+        run: |
+          pip install openpyxl pandas gspread google-auth
 
-    # 갑지 메타 및 청구금액
-    ws_gap = find_sheet(wb, ['용역청구서(갑지)', '청구서(갑지)', '갑지'])
-    project_name = ""
-    contract_no = ""
-    vendor_name = ""
-    billing_period = ""
-    billing_amount = 0
-    if ws_gap:
-        project_name = ws_gap['D3'].value or ""
-        contract_no = ws_gap['E3'].value or ""
-        vendor_name = ws_gap['G23'].value or ""
-        billing_period = ws_gap['D16'].value or ""
-        billing_amount = ws_gap['D13'].value or ws_gap['D8'].value or 0
-
-    # 경비 내역 (숙소임차료, 관리비, 식대)
-    ws_rent = find_sheet(wb, ['숙소임차료', '숙소임대료'])
-    ws_mgt = find_sheet(wb, ['숙소관리비', '관리비'])
-    ws_meal = find_sheet(wb, ['식대비용', '식대'])
-    rent_amt = ws_rent['I3'].value if (ws_rent and ws_rent['I3'].value is not None) else 0
-    mgt_amt = ws_mgt['I3'].value if (ws_mgt and ws_mgt['I3'].value is not None) else 0
-    meal_amt = ws_meal['I3'].value if (ws_meal and ws_meal['I3'].value is not None) else 0
-    housing_total = rent_amt + mgt_amt
-    expense_total = housing_total + meal_amt
-
-    # 물량 내역 (DIA-INCH)
-    ws_qty = find_sheet(wb, ['물량내역서', '물량'])
-    current_dia = 0.0
-    cum_dia = 0.0
-    if ws_qty:
-        for r in range(ws_qty.max_row, 3, -1):
-            cell_val = str(ws_qty.cell(r, 1).value or "").replace(" ", "")
-            if "합계" in cell_val or "총계" in cell_val:
-                current_dia = float(ws_qty.cell(r, 10).value or 0)
-                cum_dia = float(ws_qty.cell(r, 12).value or 0)
-                break
-
-    # 5대 공종 인건비
-    standard_jobs = ['배관공', '용접사', '관리자', '보통인부', '도비공']
-    labor_summary = {f"{job}_공수": 0.0 for job in standard_jobs}
-    labor_summary.update({f"{job}_금액": 0.0 for job in standard_jobs})
-    total_manday = 0.0
-    total_labor_amt = 0.0
-
-    ws_labor = find_sheet(wb, ['근로내역', '노무비명세서', '노무비'])
-    if ws_labor:
-        for r in range(6, ws_labor.max_row + 1):
-            name = ws_labor.cell(r, 2).value
-            if not name or str(name).strip() in ['합 계', '합계', '소계']:
-                continue
-            job_raw = ws_labor.cell(r, 4).value
-            category = map_standard_job_category(job_raw)
-            manday = float(ws_labor.cell(r, 39).value or 0)
-            pay = float(ws_labor.cell(r, 41).value or 0)
-            if f"{category}_공수" in labor_summary:
-                labor_summary[f"{category}_공수"] += manday
-                labor_summary[f"{category}_금액"] += pay
-            total_manday += manday
-            total_labor_amt += pay
-
-    return {
-        '파일명': base_name,
-        '프로젝트명': project_name,
-        '계약관리번호': contract_no,
-        '협력사명': vendor_name,
-        '청구회차': round_no,
-        '청구월': billing_month,
-        '청구공사기간': billing_period,
-        '금회청구금액_위탁비용': billing_amount,
-        '경비_숙소임차료': rent_amt,
-        '경비_숙소관리비': mgt_amt,
-        '경비_숙소소계': housing_total,
-        '경비_식대': meal_amt,
-        '경비_총합계': expense_total,
-        '금회_DIA_수량': current_dia,
-        '누계_DIA_수량': cum_dia,
-        **labor_summary,
-        '실투입_총공수': total_manday,
-        '실투입_총노무비': total_labor_amt
-    }
-
-def update_google_sheet(df: pd.DataFrame):
-    service_account_info = json.loads(os.environ["GCP_SA_KEY"])
-    spreadsheet_id = os.environ["SPREADSHEET_ID"]
-
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
-    ]
-    creds = Credentials.from_service_account_info(service_account_info, scopes=scopes)
-    gc = gspread.authorize(creds)
-
-    sh = gc.open_by_key(spreadsheet_id)
-    worksheet = sh.get_worksheet(0)
-
-    df_clean = df.fillna("")
-    values = [df_clean.columns.tolist()] + df_clean.values.tolist()
-
-    worksheet.clear()
-    worksheet.update('A1', values)
-    print(f"✓ Google Sheet({sh.title})에 총 {len(df)}건의 데이터가 성공적으로 적재되었습니다.")
-
-if __name__ == "__main__":
-    # data 폴더 내 엑셀 파일 스캔
-    files = glob.glob("data/*.xlsx")
-    files = [f for f in files if not os.path.basename(f).startswith("~$")]
-
-    if not files:
-        print("data/ 폴더에 분석할 엑셀 파일이 없습니다.")
-    else:
-        results = [parse_single_billing_file(f) for f in files]
-        df = pd.DataFrame(results)
-
-        if '청구회차' in df.columns and df['청구회차'].notna().any():
-            df = df.sort_values(by=['청구회차']).reset_index(drop=True)
-        elif '청구월' in df.columns:
-            df = df.sort_values(by=['청구월']).reset_index(drop=True)
-
-        update_google_sheet(df)
+      - name: 기성 파싱 및 구글 시트 적재 실행
+        env:
+          GCP_SA_KEY: ${{ secrets.OUTSOURCING_GCP_KEY }}
+          SPREADSHEET_ID: ${{ secrets.OUTSOURCING_SHEET_ID }}
+        run: |
+          python scripts/batch_billing_processor.py
