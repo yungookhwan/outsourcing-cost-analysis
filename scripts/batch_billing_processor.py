@@ -2,6 +2,7 @@ import os
 import re
 import glob
 import json
+import sys
 import openpyxl
 import pandas as pd
 import gspread
@@ -206,25 +207,39 @@ def main():
         print("[ERROR] GCP_SERVICE_ACCOUNT_KEY 또는 SPREADSHEET_ID 환경변수가 설정되지 않았습니다.")
         df.to_csv("parsed_billing_summary.csv", index=False, encoding='utf-8-sig')
         print("[INFO] parsed_billing_summary.csv 파일로 로컬 저장 완료.")
-        return
+        sys.exit(1)
 
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive"
     ]
-    creds_dict = json.loads(service_account_json)
-    credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-    gc = gspread.authorize(credentials)
 
-    sh = gc.open_by_key(spreadsheet_id)
-    ws = sh.get_worksheet(0)
+    try:
+        creds_dict = json.loads(service_account_json.strip())
+        credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        gc = gspread.authorize(credentials)
+    except Exception as e:
+        print(f"[ERROR] 구글 서비스 계정 인증 실패: {e}")
+        sys.exit(1)
 
-    # 헤더 포함 2차원 리스트 구성 및 전체 덮어쓰기
-    data_to_write = [df.columns.values.tolist()] + df.fillna(0).values.tolist()
+    try:
+        sh = gc.open_by_key(spreadsheet_id.strip())
+        ws = sh.get_worksheet(0)
+    except Exception as e:
+        print(f"[ERROR] 스프레드시트 열기 실패 (ID 및 권한 확인 필요): {e}")
+        sys.exit(1)
 
-    ws.clear()
-    ws.update('A1', data_to_write)
-    print(f"[SUCCESS] 구글 스프레드시트에 총 {len(df)}개 기성 데이터 덮어쓰기 적재 완료!")
+    try:
+        # 헤더 포함 2차원 리스트 구성 (NaN값 0으로 변환)
+        data_to_write = [df.columns.values.tolist()] + df.fillna(0).values.tolist()
+
+        ws.clear()
+        # gspread 최신/구버전 모두 호환되도록 명시적 키워드 인자 전달
+        ws.update(range_name='A1', values=data_to_write)
+        print(f"[SUCCESS] 구글 스프레드시트에 총 {len(df)}개 기성 데이터 덮어쓰기 적재 완료!")
+    except Exception as e:
+        print(f"[ERROR] 시트 데이터 쓰기(Update) 실패: {e}")
+        sys.exit(1)
 
 if __name__ == '__main__':
     main()
