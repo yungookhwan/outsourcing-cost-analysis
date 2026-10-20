@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - 'data/**'
+      - 'scripts/**'
   workflow_dispatch:
 
 jobs:
@@ -14,18 +15,19 @@ jobs:
       - name: 저장소 체크아웃
         uses: actions/checkout@v4
 
-      - name: 파이썬 환경 설정
+      - name: Python 3.10 설정
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.10'
 
       - name: 필수 라이브러리 설치
         run: |
+          python -m pip install --upgrade pip
           pip install openpyxl pandas gspread google-auth
 
-      - name: 기성 파싱 및 구글 시트 적재 실행
+      - name: 기성 엑셀 일괄 파싱 및 구글 시트 적재 실행
         env:
-          GCP_SA_KEY: ${{ secrets.OUTSOURCING_GCP_KEY }}
-          SPREADSHEET_ID: ${{ secrets.OUTSOURCING_SHEET_ID }}
+          GCP_SERVICE_ACCOUNT_KEY: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
         run: |
           python scripts/batch_billing_processor.py
