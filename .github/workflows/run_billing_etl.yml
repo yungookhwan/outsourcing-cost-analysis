@@ -27,7 +27,8 @@ jobs:
 
       - name: 기성 엑셀 일괄 파싱 및 구글 시트 적재 실행
         env:
-          GCP_SERVICE_ACCOUNT_KEY: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+          # GitHub Secrets 이름(OUTSOURCING_GCP_KEY)과 매핑
+          GCP_SERVICE_ACCOUNT_KEY: ${{ secrets.OUTSOURCING_GCP_KEY }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
         run: |
           python scripts/batch_billing_processor.py
