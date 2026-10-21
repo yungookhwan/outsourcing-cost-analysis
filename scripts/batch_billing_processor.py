@@ -48,67 +48,81 @@ def find_sheet_by_keywords(wb, keywords):
             return wb[name]
     return None
 
-def extract_expense_amount(sheet):
+def parse_eulji_sheet(sheet):
+    """을지(내역서) 시트 전체를 스캔하여 물량(DIA) 및 경비 항목 추출"""
+    result = {
+        "dia_now": 0.0,
+        "dia_cum": 0.0,
+        "exp_rent": 0.0,
+        "exp_mgt": 0.0,
+        "exp_meals": 0.0
+    }
     if not sheet:
-        return 0.0
-    for cell_pos in ['I2', 'H2', 'J2']:
-        try:
-            val = clean_number(sheet[cell_pos].value)
-            if val > 0:
-                return val
-        except Exception:
-            pass
-    for r in range(1, min(sheet.max_row + 1, 50)):
-        row_str = " ".join([str(sheet.cell(r, c).value or '') for c in range(1, 15)])
-        if any(k in row_str for k in ['합계', '소계', '총액', '지급액']):
-            nums = [clean_number(sheet.cell(r, c).value) for c in range(1, 15)]
-            valid_nums = [n for n in nums if n > 0]
-            if valid_nums:
-                return max(valid_nums)
-    return 0.0
+        return result
 
-def extract_quantities(sheet):
-    if not sheet:
-        return 0.0, 0.0
-    try:
-        j_val = clean_number(sheet['J50'].value)
-        l_val = clean_number(sheet['L50'].value)
-        if j_val > 0 or l_val > 0:
-            return j_val, l_val
-    except Exception:
-        pass
+    item_col = 2
+    qty_now_col = None
+    amt_now_col = None
+    qty_cum_col = None
+    amt_cum_col = None
 
-    col_now, col_cum = None, None
+    # 1. 헤더 행 및 주요 열 위치 자동 탐색 (1~15행 스캔)
     for r in range(1, 15):
-        row_vals = [str(sheet.cell(r, c).value or '').strip() for c in range(1, 25)]
+        row_vals = [str(sheet.cell(r, c).value or '').strip() for c in range(1, 30)]
         for c, val in enumerate(row_vals, 1):
-            if '금회' in val and any(k in val for k in ['수량', '물량', 'DIA']):
-                col_now = c
-            elif '누계' in val and any(k in val for k in ['수량', '물량', 'DIA']):
-                col_cum = c
-        if col_now and col_cum:
+            val_clean = re.sub(r'\s+', '', val)
+            if any(k in val_clean for k in ['품명', '항목', '공종', '내역']):
+                item_col = c
+            elif '금회' in val_clean:
+                if any(k in val_clean for k in ['수량', '물량']): qty_now_col = c
+                elif any(k in val_clean for k in ['금액', '청구액', '합계']): amt_now_col = c
+            elif '누계' in val_clean:
+                if any(k in val_clean for k in ['수량', '물량']): qty_cum_col = c
+                elif any(k in val_clean for k in ['금액', '합계']): amt_cum_col = c
+
+        if qty_now_col and amt_now_col:
             break
 
-    dia_now, dia_cum = 0.0, 0.0
-    for r in range(10, sheet.max_row + 1):
-        cell_label = str(sheet.cell(r, 1).value or '') + str(sheet.cell(r, 2).value or '') + str(sheet.cell(r, 3).value or '')
-        if '합계' in cell_label or '총계' in cell_label:
-            if col_now and col_cum:
-                dia_now = clean_number(sheet.cell(r, col_now).value)
-                dia_cum = clean_number(sheet.cell(r, col_cum).value)
-            else:
-                row_nums = [clean_number(sheet.cell(r, c).value) for c in range(4, 20)]
-                valid_nums = [n for n in row_nums if n > 0]
-                if len(valid_nums) >= 2:
-                    dia_now = valid_nums[0]
-                    dia_cum = valid_nums[1]
-            break
-    return dia_now, dia_cum
+    # 열을 명확히 식별하지 못했을 경우의 기본 폴백 열 번호 할당
+    if not amt_now_col: amt_now_col = 7
+    if not qty_now_col: qty_now_col = 5
+    if not qty_cum_col: qty_cum_col = qty_now_col + 2
+
+    # 2. 내역서 행 단위 스캔
+    for r in range(1, sheet.max_row + 1):
+        row_text = " ".join([str(sheet.cell(r, c).value or '') for c in range(1, min(sheet.max_column + 1, 15))])
+        norm_row_text = re.sub(r'\s+', '', row_text)
+
+        # (1) 물량 (DIA INCH)
+        if any(k in norm_row_text for k in ['DIA', '인치', '용접물량', '배관물량', '시공물량']):
+            q_now = clean_number(sheet.cell(r, qty_now_col).value)
+            q_cum = clean_number(sheet.cell(r, qty_cum_col).value)
+            if q_now > 0 or q_cum > 0:
+                result["dia_now"] = q_now
+                result["dia_cum"] = q_cum
+
+        # (2) 숙소임차료
+        if any(k in norm_row_text for k in ['숙소임차', '임차료', '월세']):
+            amt = clean_number(sheet.cell(r, amt_now_col).value)
+            if amt > 0: result["exp_rent"] = amt
+
+        # (3) 숙소관리비
+        if any(k in norm_row_text for k in ['숙소관리', '관리비', '공과금']):
+            amt = clean_number(sheet.cell(r, amt_now_col).value)
+            if amt > 0: result["exp_mgt"] = amt
+
+        # (4) 식대비용
+        if any(k in norm_row_text for k in ['식대', '식비', '중식', '석식']):
+            amt = clean_number(sheet.cell(r, amt_now_col).value)
+            if amt > 0: result["exp_meals"] = amt
+
+    return result
 
 def parse_single_excel(file_path):
     wb = openpyxl.load_workbook(file_path, data_only=True)
     file_name = os.path.basename(file_path)
 
+    # (1) 표지 및 기본 메타 정보
     ws_cover = find_sheet_by_keywords(wb, ['표지', '용역청구서표지'])
     ws_gap = find_sheet_by_keywords(wb, ['갑지', '용역청구서(갑지)']) or wb.active
 
@@ -132,6 +146,7 @@ def parse_single_excel(file_path):
     else:
         claim_month = "2026-09"
 
+    # 금회 위탁비용
     claim_cost = clean_number(ws_gap['D13'].value)
     if claim_cost == 0.0:
         for r in range(10, 20):
@@ -140,19 +155,36 @@ def parse_single_excel(file_path):
                 claim_cost = val
                 break
 
-    ws_rent = find_sheet_by_keywords(wb, ['숙소임차', '임차료', '숙소임차료'])
-    ws_mgt = find_sheet_by_keywords(wb, ['숙소관리', '관리비', '숙소관리비'])
-    ws_meals = find_sheet_by_keywords(wb, ['식대', '식대비용'])
+    # (2) 을지(내역서)에서 경비 및 물량 일괄 추출
+    ws_eulji = find_sheet_by_keywords(wb, ['을지', '청구내역', '총괄내역', '내역서', '집계표', '물량내역서'])
+    eulji_res = parse_eulji_sheet(ws_eulji)
 
-    exp_rent = extract_expense_amount(ws_rent)
-    exp_mgt = extract_expense_amount(ws_mgt)
+    exp_rent = eulji_res["exp_rent"]
+    exp_mgt = eulji_res["exp_mgt"]
+    exp_meals = eulji_res["exp_meals"]
+    dia_now = eulji_res["dia_now"]
+    dia_cum = eulji_res["dia_cum"]
+
+    # 개별 전용 탭이 존재하는 경우 보완 확인 (Fallback)
+    if exp_rent == 0.0:
+        ws_r = find_sheet_by_keywords(wb, ['숙소임차', '임차료'])
+        if ws_r: exp_rent = clean_number(ws_r['I2'].value)
+    if exp_mgt == 0.0:
+        ws_m = find_sheet_by_keywords(wb, ['숙소관리', '관리비'])
+        if ws_m: exp_mgt = clean_number(ws_m['I2'].value)
+    if exp_meals == 0.0:
+        ws_meal = find_sheet_by_keywords(wb, ['식대', '식대비용'])
+        if ws_meal: exp_meals = clean_number(ws_meal['I2'].value)
+    if dia_now == 0.0 and dia_cum == 0.0:
+        ws_q = find_sheet_by_keywords(wb, ['물량내역', '물량'])
+        if ws_q:
+            dia_now = clean_number(ws_q['J50'].value)
+            dia_cum = clean_number(ws_q['L50'].value)
+
     exp_dorm = exp_rent + exp_mgt
-    exp_meals = extract_expense_amount(ws_meals)
     exp_total = exp_dorm + exp_meals
 
-    ws_qty = find_sheet_by_keywords(wb, ['물량내역서', '물량', '내역서'])
-    dia_now, dia_cum = extract_quantities(ws_qty)
-
+    # (3) 인건비(노무비/근로내역) 추출
     craft_data = {
         '배관공': {'공수': 0.0, '금액': 0.0},
         '용접사': {'공수': 0.0, '금액': 0.0},
@@ -224,6 +256,13 @@ def main():
     if not excel_files:
         print("[INFO] data/ 폴더에 처리할 기성 파일이 없습니다.")
         return
+
+    # 첫 번째 파일의 실제 시트 구성 확인용 출력
+    try:
+        sample_wb = openpyxl.load_workbook(excel_files[0], data_only=True)
+        print(f"[DEBUG] 샘플 파일 시트 목록 ({os.path.basename(excel_files[0])}): {sample_wb.sheetnames}")
+    except Exception as e:
+        print(f"[DEBUG] 시트 목록 로드 실패: {e}")
 
     print(f"[INFO] 총 {len(excel_files)}개의 기성 파일을 일괄 처리합니다.")
     records = []
