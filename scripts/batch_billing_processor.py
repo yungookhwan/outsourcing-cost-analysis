@@ -47,20 +47,102 @@ def map_standard_craft(job_title):
         return '관리자'
     return '기타'
 
+def find_sheet_by_keywords(wb, keywords):
+    """시트 이름에서 공백을 제거하고 키워드 포함 여부로 시트 객체 반환"""
+    for name in wb.sheetnames:
+        norm_name = re.sub(r'\s+', '', name)
+        if any(re.sub(r'\s+', '', kw) in norm_name for kw in keywords):
+            return wb[name]
+    return None
+
+def extract_expense_amount(sheet):
+    """경비 시트에서 I2 우선 조회 후, 없을 시 '합계'/'소계' 행 또는 숫자 탐색"""
+    if not sheet:
+        return 0.0
+
+    # 1. 기존 기본 위치 (I2 또는 H2) 우선 확인
+    for cell_pos in ['I2', 'H2', 'J2']:
+        try:
+            val = clean_number(sheet[cell_pos].value)
+            if val > 0:
+                return val
+        except Exception:
+            pass
+
+    # 2. '합계' 또는 '총액' 행을 찾아 해당 행의 최대 숫자 추출
+    for r in range(1, min(sheet.max_row + 1, 50)):
+        row_str = " ".join([str(sheet.cell(r, c).value or '') for c in range(1, 15)])
+        if any(k in row_str for k in ['합계', '소계', '총액', '지급액']):
+            nums = [clean_number(sheet.cell(r, c).value) for c in range(1, 15)]
+            valid_nums = [n for n in nums if n > 0]
+            if valid_nums:
+                return max(valid_nums)
+
+    return 0.0
+
+def extract_quantities(sheet):
+    """물량 내역서 시트에서 금회 및 누계 물량 자동 탐색"""
+    if not sheet:
+        return 0.0, 0.0
+
+    dia_now = 0.0
+    dia_cum = 0.0
+
+    # 1. 기존 표준 위치 (J50, L50) 우선 확인
+    try:
+        j_val = clean_number(sheet['J50'].value)
+        l_val = clean_number(sheet['L50'].value)
+        if j_val > 0 or l_val > 0:
+            return j_val, l_val
+    except Exception:
+        pass
+
+    # 2. 동적 헤더 및 합계행 식별
+    col_now = None
+    col_cum = None
+
+    for r in range(1, 15):
+        row_vals = [str(sheet.cell(r, c).value or '').strip() for c in range(1, 25)]
+        for c, val in enumerate(row_vals, 1):
+            if '금회' in val and any(k in val for k in ['수량', '물량', 'DIA']):
+                col_now = c
+            elif '누계' in val and any(k in val for k in ['수량', '물량', 'DIA']):
+                col_cum = c
+
+        if col_now and col_cum:
+            break
+
+    # 합계 행 탐색
+    for r in range(10, sheet.max_row + 1):
+        cell_label = str(sheet.cell(r, 1).value or '') + str(sheet.cell(r, 2).value or '') + str(sheet.cell(r, 3).value or '')
+        if '합계' in cell_label or '총계' in cell_label:
+            if col_now and col_cum:
+                dia_now = clean_number(sheet.cell(r, col_now).value)
+                dia_cum = clean_number(sheet.cell(r, col_cum).value)
+            else:
+                # 열을 못 찾았을 경우 합계 행 내 유효한 숫자 중 추출
+                row_nums = [clean_number(sheet.cell(r, c).value) for c in range(4, 20)]
+                valid_nums = [n for n in row_nums if n > 0]
+                if len(valid_nums) >= 2:
+                    dia_now = valid_nums[0]
+                    dia_cum = valid_nums[1]
+            break
+
+    return dia_now, dia_cum
+
 # --------------------------------------------------------------------------
-# 2. 개별 엑셀 파일 파싱 엔진 (노무비명세서/근로내역 우선 추출)
+# 2. 개별 엑셀 파일 파싱 엔진
 # --------------------------------------------------------------------------
 def parse_single_excel(file_path):
     wb = openpyxl.load_workbook(file_path, data_only=True)
     file_name = os.path.basename(file_path)
 
-    # (1) 기본 정보 탐색 (표지 및 갑지)
-    ws_cover = wb['용역청구서 표지'] if '용역청구서 표지' in wb.sheetnames else None
-    ws_gap = wb['용역 청구서(갑지)'] if '용역 청구서(갑지)' in wb.sheetnames else wb.active
+    # (1) 기본 정보 탐색
+    ws_cover = find_sheet_by_keywords(wb, ['표지', '용역청구서표지'])
+    ws_gap = find_sheet_by_keywords(wb, ['갑지', '용역청구서(갑지)']) or wb.active
 
     pjt_name = ws_cover['B7'].value if (ws_cover and ws_cover['B7'].value) else "P4 Ph4 GAS 1공구 마감공사"
 
-    # 협력사명 정제
     raw_vendor = ws_cover['C15'].value if (ws_cover and ws_cover['C15'].value) else ""
     if not raw_vendor:
         for v in ['대성이엔지', '태성하이텍', '리도시스템']:
@@ -69,7 +151,6 @@ def parse_single_excel(file_path):
                 break
     vendor_name = clean_vendor_name(raw_vendor)
 
-    # 청구월 (YYYY-MM 형식)
     raw_month = ws_cover['C14'].value if (ws_cover and ws_cover['C14'].value) else file_name
     month_match = re.search(r'(\d{2,4})년?\s*(\d{1,2})월?', str(raw_month))
     if month_match:
@@ -80,25 +161,31 @@ def parse_single_excel(file_path):
     else:
         claim_month = "2026-09"
 
-    # (2) 금회 위탁비용 (갑지 D13: 금회 청구금액)
+    # (2) 금회 위탁비용 (갑지 D13 우선, 없으면 D열 합계 탐색)
     claim_cost = clean_number(ws_gap['D13'].value)
+    if claim_cost == 0.0:
+        for r in range(10, 20):
+            val = clean_number(ws_gap.cell(r, 4).value)
+            if val > 0:
+                claim_cost = val
+                break
 
-    # (3) 경비 내역 (숙소임차료, 숙소관리비, 식대비용)
-    exp_rent = clean_number(wb['숙소임차료']['I2'].value) if '숙소임차료' in wb.sheetnames else 0.0
-    exp_mgt = clean_number(wb['숙소관리비']['I2'].value) if '숙소관리비' in wb.sheetnames else 0.0
+    # (3) 경비 내역 동적 탐색
+    ws_rent = find_sheet_by_keywords(wb, ['숙소임차', '임차료', '숙소임차료'])
+    ws_mgt = find_sheet_by_keywords(wb, ['숙소관리', '관리비', '숙소관리비'])
+    ws_meals = find_sheet_by_keywords(wb, ['식대', '식대비용'])
+
+    exp_rent = extract_expense_amount(ws_rent)
+    exp_mgt = extract_expense_amount(ws_mgt)
     exp_dorm = exp_rent + exp_mgt
-    exp_meals = clean_number(wb['식대비용']['I2'].value) if '식대비용' in wb.sheetnames else 0.0
+    exp_meals = extract_expense_amount(ws_meals)
     exp_total = exp_dorm + exp_meals
 
-    # (4) 시공 물량 (물량 내역서)
-    dia_now = 0.0
-    dia_cum = 0.0
-    if '물량 내역서' in wb.sheetnames:
-        ws_qty = wb['물량 내역서']
-        dia_now = clean_number(ws_qty['J50'].value)
-        dia_cum = clean_number(ws_qty['L50'].value)
+    # (4) 시공 물량 동적 탐색
+    ws_qty = find_sheet_by_keywords(wb, ['물량내역서', '물량', '내역서'])
+    dia_now, dia_cum = extract_quantities(ws_qty)
 
-    # (5) 기술인 인건비: 내역서(을지) 제외, '근로내역' / '노무비명세서' 시트 탐색
+    # (5) 기술인 인건비 동적 탐색
     craft_data = {
         '배관공': {'공수': 0.0, '금액': 0.0},
         '용접사': {'공수': 0.0, '금액': 0.0},
@@ -107,17 +194,12 @@ def parse_single_excel(file_path):
         '도비공': {'공수': 0.0, '금액': 0.0}
     }
 
-    work_sheet = None
-    for s in wb.sheetnames:
-        if any(k in s for k in ['근로내역', '노무비명세서', '노무비', '출력일보']):
-            work_sheet = wb[s]
-            break
+    work_sheet = find_sheet_by_keywords(wb, ['근로내역', '노무비명세서', '노무비', '출력일보'])
 
     if work_sheet:
         header_row = 5
         job_col, md_col, amt_col = 4, 39, 41
 
-        # 동적 헤더 위치 식별
         for r in range(1, 10):
             row_vals = [str(work_sheet.cell(r, c).value or '') for c in range(1, 45)]
             if any('직종' in v for v in row_vals) and any('공수' in v for v in row_vals):
@@ -128,7 +210,6 @@ def parse_single_excel(file_path):
                     elif any(k in val for k in ['총액', '지급액', '합계', '금액']): amt_col = c
                 break
 
-        # 개별 작업자 실데이터 추출
         for r in range(header_row + 1, work_sheet.max_row + 1):
             name_val = work_sheet.cell(r, 2).value
             job_val = work_sheet.cell(r, job_col).value
@@ -156,90 +237,4 @@ def parse_single_excel(file_path):
         "경비_숙소관리비": exp_mgt,
         "경비_숙소소계": exp_dorm,
         "경비_식대": exp_meals,
-        "경비_총합계": exp_total,
-        "금회_DIA_수량": dia_now,
-        "누계_DIA_수량": dia_cum,
-        "배관공_공수": craft_data['배관공']['공수'],
-        "배관공_금액": craft_data['배관공']['금액'],
-        "용접사_공수": craft_data['용접사']['공수'],
-        "용접사_금액": craft_data['용접사']['금액'],
-        "관리자_공수": craft_data['관리자']['공수'],
-        "관리자_금액": craft_data['관리자']['금액'],
-        "보통인부_공수": craft_data['보통인부']['공수'],
-        "보통인부_금액": craft_data['보통인부']['금액'],
-        "도비공_공수": craft_data['도비공']['공수'],
-        "도비공_금액": craft_data['도비공']['금액'],
-        "실투입_총공수": total_md,
-        "실투입_총노무비": total_labor
-    }
-
-# --------------------------------------------------------------------------
-# 3. 구글 스프레드시트 적재 메인 실행부
-# --------------------------------------------------------------------------
-def main():
-    excel_files = glob.glob('data/*.xlsx') + glob.glob('data/*.xls')
-    if not excel_files:
-        print("[INFO] data/ 폴더에 처리할 기성 파일이 없습니다.")
-        return
-
-    print(f"[INFO] 총 {len(excel_files)}개의 기성 파일을 일괄 처리합니다.")
-    records = []
-    for f in excel_files:
-        try:
-            rec = parse_single_excel(f)
-            records.append(rec)
-            print(f" [성공] {rec['협력업체명']} ({rec['청구월']}): 위탁 {rec['금회_위탁비용']:,}원 | 공수 {rec['실투입_총공수']} M/D | 노무비 {rec['실투입_총노무비']:,}원")
-        except Exception as e:
-            print(f" [오류] {f} 파싱 중 예외 발생: {e}")
-
-    if not records:
-        print("[WARN] 유효한 기성 데이터가 없습니다.")
-        return
-
-    df = pd.DataFrame(records)
-    df = df.sort_values(by=['청구월', '협력업체명'], ascending=[True, True])
-
-    # GitHub Actions 환경변수 읽기
-    service_account_json = os.environ.get('GCP_SERVICE_ACCOUNT_KEY')
-    spreadsheet_id = os.environ.get('SPREADSHEET_ID')
-
-    if not service_account_json or not spreadsheet_id:
-        print("[ERROR] GCP_SERVICE_ACCOUNT_KEY 또는 SPREADSHEET_ID 환경변수가 설정되지 않았습니다.")
-        df.to_csv("parsed_billing_summary.csv", index=False, encoding='utf-8-sig')
-        print("[INFO] parsed_billing_summary.csv 파일로 로컬 저장 완료.")
-        sys.exit(1)
-
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
-    ]
-
-    try:
-        creds_dict = json.loads(service_account_json.strip())
-        credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        gc = gspread.authorize(credentials)
-    except Exception as e:
-        print(f"[ERROR] 구글 서비스 계정 인증 실패: {e}")
-        sys.exit(1)
-
-    try:
-        sh = gc.open_by_key(spreadsheet_id.strip())
-        ws = sh.get_worksheet(0)
-    except Exception as e:
-        print(f"[ERROR] 스프레드시트 열기 실패 (ID 및 권한 확인 필요): {e}")
-        sys.exit(1)
-
-    try:
-        # 헤더 포함 2차원 리스트 구성 (NaN값 0으로 변환)
-        data_to_write = [df.columns.values.tolist()] + df.fillna(0).values.tolist()
-
-        ws.clear()
-        # gspread 최신/구버전 모두 호환되도록 명시적 키워드 인자 전달
-        ws.update(range_name='A1', values=data_to_write)
-        print(f"[SUCCESS] 구글 스프레드시트에 총 {len(df)}개 기성 데이터 덮어쓰기 적재 완료!")
-    except Exception as e:
-        print(f"[ERROR] 시트 데이터 쓰기(Update) 실패: {e}")
-        sys.exit(1)
-
-if __name__ == '__main__':
-    main()
+        "경비_총합계
