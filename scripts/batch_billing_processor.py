@@ -46,12 +46,12 @@ def load_any_workbook(file_path):
 # 1. 문자열 정제 및 직종 매핑 헬퍼 함수
 # --------------------------------------------------------------------------
 def clean_vendor_name(name):
+    """(주), 주식회사, 공종 표기(FAB, SUP 등) 제거"""
     if not name:
         return ""
     cleaned = str(name).strip()
     cleaned = re.sub(r'[\(（]?[주株式]+[\)）]?', '', cleaned)
     cleaned = cleaned.replace('㈜', '').replace('주식회사', '').strip()
-    # 공종 태그 제거 (FAB, SUP 등)
     cleaned = re.sub(r'[\(（]?(FAB|SUP|gas|pcw|pwc)[\)）]?', '', cleaned, flags=re.I).strip()
     return cleaned
 
@@ -150,11 +150,8 @@ def parse_single_excel(file_path):
     ws_cover = find_sheet_by_keywords(wb, ['표지', '용역청구서표지'])
     ws_gap = find_sheet_by_keywords(wb, ['갑지', '용역청구서(갑지)']) or wb.active
 
-    # -------------------------------------------------------------
-    # (1) PJT_NO 엄격 탐색 (S25-004, S26-001 형식 우선)
-    # -------------------------------------------------------------
+    # (1) PJT_NO 엄격 탐색 (S25-004, S26-001 등)
     pjt_no = ""
-    # 1. 표지 상단 영역에서 'S00-000' 형태 정규식 검색
     if ws_cover:
         for r in range(1, 15):
             for c in range(1, 8):
@@ -165,26 +162,21 @@ def parse_single_excel(file_path):
                     break
             if pjt_no: break
 
-    # 2. 파일명에서 'S00-000' 검색 (예: (S26-001)8월 기성청구서...)
     if not pjt_no:
         s_match = re.search(r'[\(（]?(S\d{2}-\d{3,4})[\)）]?', file_name, re.I)
         if s_match:
             pjt_no = s_match.group(1).upper()
 
-    # 3. 표지 B8 셀 값 확인 (위 정규식에 안 걸린 일반 번호인 경우)
     if not pjt_no and ws_cover and ws_cover['B8'].value:
         cand_b8 = str(ws_cover['B8'].value).strip()
         if cand_b8 and len(cand_b8) >= 4 and not any(k in cand_b8 for k in ['공사', '청구서', '갑지', '공구']):
             pjt_no = cand_b8
 
-    # 4. 폴백: 공구/Ph 구분 코드
     if not pjt_no:
         ph_match = re.search(r'(P\d+\s*Ph\d+)', file_name, re.I)
         pjt_no = ph_match.group(1).strip() if ph_match else "기타 PJT"
 
-    # -------------------------------------------------------------
     # (2) PJT명 동적 추출
-    # -------------------------------------------------------------
     pjt_name = ""
     if ws_cover and ws_cover['B7'].value:
         pjt_name = str(ws_cover['B7'].value).strip()
@@ -206,19 +198,16 @@ def parse_single_excel(file_path):
         if not pjt_name:
             pjt_name = "일반공사"
 
-    # -------------------------------------------------------------
-    # (3) 협력업체명 정밀 동적 감지 ('기타' 방지 및 상호 복원)
-    # -------------------------------------------------------------
+    # (3) 협력업체명 100% 동적 추출 (사전 하드코딩 완전 배제)
     raw_vendor = ""
     
-    # 1. 표지 및 갑지 셀 전체에서 상호명 검색
+    # 1. 엑셀 표지/갑지 내 라벨 기반 검색 (우측 4개 열 및 병합 셀 완벽 스캔)
     search_sheets = [s for s in [ws_cover, ws_gap] if s]
     for ws_target in search_sheets:
         for r in range(5, 25):
             for c in range(1, 6):
                 lbl = str(ws_target.cell(r, c).value or '').strip()
                 if any(k in lbl for k in ['상호', '업체명', '상 호', '협력업체', '수급인']):
-                    # 우측 1~4열 확인 (셀 병합 대응)
                     for offset in range(1, 5):
                         val = clean_vendor_name(str(ws_target.cell(r, c + offset).value or ''))
                         if val and len(val) >= 2 and not any(k in val for k in ['상호', '성명', '대표', '주식회사']):
@@ -228,7 +217,7 @@ def parse_single_excel(file_path):
             if raw_vendor: break
         if raw_vendor: break
 
-    # 2. 파일명 괄호 내부 탐색 (예: 투입비내역서(대성이엔지) -> 대성이엔지)
+    # 2. 표지에 상호가 없을 경우 파일명 괄호 파싱
     if not raw_vendor:
         clean_fn = re.sub(r'\.(xlsx|xls)$', '', file_name, flags=re.I)
         paren_matches = re.findall(r'[\(（]([^\)）]+)[\)）]', clean_fn)
@@ -238,7 +227,7 @@ def parse_single_excel(file_path):
                 raw_vendor = cand_clean
                 break
 
-    # 3. 파일명 언더바 분할 탐색
+    # 3. 파일명 언더바 분할 파싱
     if not raw_vendor:
         clean_fn = re.sub(r'\.(xlsx|xls)$', '', file_name, flags=re.I)
         parts = clean_fn.split('_')
@@ -248,7 +237,6 @@ def parse_single_excel(file_path):
         ]
         for p in reversed(parts):
             p_cand = clean_vendor_name(p)
-            # 숫자가 3개 이상 포함(금액, 날짜)되거나 무효 키워드면 건너뜀
             if len(re.findall(r'\d', p_cand)) >= 2 or any(k in p_cand.upper() for k in invalid_keywords):
                 continue
             if len(p_cand) >= 2:
@@ -257,9 +245,7 @@ def parse_single_excel(file_path):
 
     vendor_name = clean_vendor_name(raw_vendor) if raw_vendor else "기타"
 
-    # -------------------------------------------------------------
     # (4) 청구월 (YYYY-MM)
-    # -------------------------------------------------------------
     raw_month = ws_cover['C14'].value if (ws_cover and ws_cover['C14'].value) else file_name
     month_match = re.search(r'(\d{2,4})년?\s*(\d{1,2})월?', str(raw_month))
     if month_match:
@@ -308,7 +294,7 @@ def parse_single_excel(file_path):
 
     exp_total = exp_dorm + exp_meals
 
-    # (7) 인건비 (근로내역 / 노무비명세서)
+    # (7) 인건비
     craft_data = {
         '배관공': {'공수': 0.0, '금액': 0.0},
         '용접사': {'공수': 0.0, '금액': 0.0},
@@ -377,7 +363,7 @@ def parse_single_excel(file_path):
     }
 
 # --------------------------------------------------------------------------
-# 4. 구글 스프레드시트 적재 메인 실행부
+# 4. 전체 데이터 후처리: 동적 상호 통합 및 구글 시트 적재
 # --------------------------------------------------------------------------
 def main():
     excel_files = glob.glob('data/*.xlsx') + glob.glob('data/*.xls')
@@ -391,7 +377,6 @@ def main():
         try:
             rec = parse_single_excel(f)
             records.append(rec)
-            print(f" [성공] [{rec['PJT_NO']}] {rec['협력업체명']} ({rec['청구월']}): 위탁 {rec['금회_위탁비용']:,}원 | 경비 {rec['경비_총합계']:,}원 | DIA {rec['금회_DIA_수량']} | 공수 {rec['실투입_총공수']} M/D")
         except Exception as e:
             print(f" [오류] {f} 파싱 중 예외 발생: {e}")
 
@@ -399,45 +384,48 @@ def main():
         print("[WARN] 유효한 기성 데이터가 없습니다.")
         return
 
+    # [핵심] 2-Pass 동적 상호 자동 통합 (코드 수정 없이 신규 업체 자동 흡수)
+    # 1. 4글자 이상의 정식 풀네임 목록을 동적으로 자동 수집
+    distinct_vendors = {r['협력업체명'] for r in records if r['협력업체명'] and r['협력업체명'] != '기타'}
+    long_names = sorted([v for v in distinct_vendors if len(v) >= 4], key=len, reverse=True)
+
+    # 2. 2~3글자 약칭으로 들어간 업체명을 해당 풀네임으로 자동 치환
+    for r in records:
+        v = r['협력업체명']
+        if len(v) <= 3 and v != '기타':
+            for full in long_names:
+                if full.startswith(v):
+                    r['협력업체명'] = full
+                    break
+        print(f" [완료] [{r['PJT_NO']}] {r['협력업체명']} ({r['청구월']}): 위탁 {r['금회_위탁비용']:,}원 | DIA {r['금회_DIA_수량']}")
+
     df = pd.DataFrame(records)
     df = df.sort_values(by=['PJT_NO', '청구월', '협력업체명'], ascending=[True, True, True])
 
+    # 구글 시트 적재
     service_account_json = os.environ.get('GCP_SERVICE_ACCOUNT_KEY')
     spreadsheet_id = os.environ.get('SPREADSHEET_ID')
 
     if not service_account_json or not spreadsheet_id:
         print("[ERROR] GCP_SERVICE_ACCOUNT_KEY 또는 SPREADSHEET_ID 환경변수가 설정되지 않았습니다.")
         df.to_csv("parsed_billing_summary.csv", index=False, encoding='utf-8-sig')
-        print("[INFO] parsed_billing_summary.csv 파일로 로컬 저장 완료.")
         sys.exit(1)
 
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
-    ]
+    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
 
     try:
         creds_dict = json.loads(service_account_json.strip())
         credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
         gc = gspread.authorize(credentials)
-    except Exception as e:
-        print(f"[ERROR] 구글 서비스 계정 인증 실패: {e}")
-        sys.exit(1)
-
-    try:
         sh = gc.open_by_key(spreadsheet_id.strip())
         ws = sh.get_worksheet(0)
-    except Exception as e:
-        print(f"[ERROR] 스프레드시트 열기 실패 (ID 및 권한 확인 필요): {e}")
-        sys.exit(1)
 
-    try:
         data_to_write = [df.columns.values.tolist()] + df.fillna(0).values.tolist()
         ws.clear()
         ws.update(range_name='A1', values=data_to_write)
         print(f"[SUCCESS] 구글 스프레드시트에 총 {len(df)}개 기성 데이터 덮어쓰기 적재 완료!")
     except Exception as e:
-        print(f"[ERROR] 시트 데이터 쓰기(Update) 실패: {e}")
+        print(f"[ERROR] 구글 시트 적재 실패: {e}")
         sys.exit(1)
 
 if __name__ == '__main__':
