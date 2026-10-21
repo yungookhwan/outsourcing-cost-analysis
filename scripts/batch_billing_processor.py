@@ -48,73 +48,59 @@ def find_sheet_by_keywords(wb, keywords):
             return wb[name]
     return None
 
-def parse_eulji_sheet(sheet):
-    """을지(내역서) 시트 전체를 스캔하여 물량(DIA) 및 경비 항목 추출"""
+def parse_jibgye_sheet(sheet):
+    """'집계장' 시트에서 WELDING POINT(D/I 수량) 및 숙소/식대 경비 추출"""
     result = {
         "dia_now": 0.0,
         "dia_cum": 0.0,
-        "exp_rent": 0.0,
-        "exp_mgt": 0.0,
+        "exp_dorm": 0.0,
         "exp_meals": 0.0
     }
     if not sheet:
         return result
 
-    item_col = 2
-    qty_now_col = None
-    amt_now_col = None
-    qty_cum_col = None
-    amt_cum_col = None
+    item_col = 2        # 내역 (기본 B열)
+    unit_col = 3        # 단위 (기본 C열)
+    qty_col = 4         # 수량 (기본 D열)
+    now_amt_col = 7     # 금회기성 (기본 G열)
+    cum_amt_col = 8     # 누계기성 (기본 H열)
 
-    # 1. 헤더 행 및 주요 열 위치 자동 탐색 (1~15행 스캔)
-    for r in range(1, 15):
-        row_vals = [str(sheet.cell(r, c).value or '').strip() for c in range(1, 30)]
+    # 1. 헤더 행(1~5행)에서 실제 열 위치 동적 매핑
+    for r in range(1, 6):
+        row_vals = [str(sheet.cell(r, c).value or '').strip() for c in range(1, 15)]
         for c, val in enumerate(row_vals, 1):
-            val_clean = re.sub(r'\s+', '', val)
-            if any(k in val_clean for k in ['품명', '항목', '공종', '내역']):
-                item_col = c
-            elif '금회' in val_clean:
-                if any(k in val_clean for k in ['수량', '물량']): qty_now_col = c
-                elif any(k in val_clean for k in ['금액', '청구액', '합계']): amt_now_col = c
-            elif '누계' in val_clean:
-                if any(k in val_clean for k in ['수량', '물량']): qty_cum_col = c
-                elif any(k in val_clean for k in ['금액', '합계']): amt_cum_col = c
+            clean_v = re.sub(r'\s+', '', val)
+            if '내역' in clean_v: item_col = c
+            elif '단위' in clean_v: unit_col = c
+            elif '수량' in clean_v: qty_col = c
+            elif '금회' in clean_v and any(k in clean_v for k in ['기성', '금액']): now_amt_col = c
+            elif '누계' in clean_v and any(k in clean_v for k in ['기성', '금액']): cum_amt_col = c
 
-        if qty_now_col and amt_now_col:
-            break
-
-    # 열을 명확히 식별하지 못했을 경우의 기본 폴백 열 번호 할당
-    if not amt_now_col: amt_now_col = 7
-    if not qty_now_col: qty_now_col = 5
-    if not qty_cum_col: qty_cum_col = qty_now_col + 2
-
-    # 2. 내역서 행 단위 스캔
+    # 2. 행 데이터 스캔
     for r in range(1, sheet.max_row + 1):
-        row_text = " ".join([str(sheet.cell(r, c).value or '') for c in range(1, min(sheet.max_column + 1, 15))])
-        norm_row_text = re.sub(r'\s+', '', row_text)
+        item_val = str(sheet.cell(r, item_col).value or '').strip()
+        unit_val = str(sheet.cell(r, unit_col).value or '').strip()
+        row_str = " ".join([str(sheet.cell(r, c).value or '') for c in range(1, 10)])
+        clean_row = re.sub(r'\s+', '', row_str)
 
-        # (1) 물량 (DIA INCH)
-        if any(k in norm_row_text for k in ['DIA', '인치', '용접물량', '배관물량', '시공물량']):
-            q_now = clean_number(sheet.cell(r, qty_now_col).value)
-            q_cum = clean_number(sheet.cell(r, qty_cum_col).value)
-            if q_now > 0 or q_cum > 0:
-                result["dia_now"] = q_now
-                result["dia_cum"] = q_cum
+        # (1) 물량 (WELDING POINT / D/I 수량)
+        if 'WELDING' in item_val.upper() or 'D/I' in unit_val.upper() or 'WELDINGPOINT' in clean_row:
+            dia_val = clean_number(sheet.cell(r, qty_col).value)
+            if dia_val > 0:
+                result["dia_now"] = dia_val
+                result["dia_cum"] = dia_val
 
-        # (2) 숙소임차료
-        if any(k in norm_row_text for k in ['숙소임차', '임차료', '월세']):
-            amt = clean_number(sheet.cell(r, amt_now_col).value)
-            if amt > 0: result["exp_rent"] = amt
+        # (2) 숙소 (임대료+관리비)
+        if any(k in clean_row for k in ['임대료+관리비', '숙소', '임차료']):
+            amt = clean_number(sheet.cell(r, now_amt_col).value)
+            if amt > 0:
+                result["exp_dorm"] = amt
 
-        # (3) 숙소관리비
-        if any(k in norm_row_text for k in ['숙소관리', '관리비', '공과금']):
-            amt = clean_number(sheet.cell(r, amt_now_col).value)
-            if amt > 0: result["exp_mgt"] = amt
-
-        # (4) 식대비용
-        if any(k in norm_row_text for k in ['식대', '식비', '중식', '석식']):
-            amt = clean_number(sheet.cell(r, amt_now_col).value)
-            if amt > 0: result["exp_meals"] = amt
+        # (3) 식대
+        if '식대' in clean_row and '인원' not in clean_row:
+            amt = clean_number(sheet.cell(r, now_amt_col).value)
+            if amt > 0:
+                result["exp_meals"] = amt
 
     return result
 
@@ -122,7 +108,7 @@ def parse_single_excel(file_path):
     wb = openpyxl.load_workbook(file_path, data_only=True)
     file_name = os.path.basename(file_path)
 
-    # (1) 표지 및 기본 메타 정보
+    # 1. 표지 및 메타데이터
     ws_cover = find_sheet_by_keywords(wb, ['표지', '용역청구서표지'])
     ws_gap = find_sheet_by_keywords(wb, ['갑지', '용역청구서(갑지)']) or wb.active
 
@@ -155,36 +141,37 @@ def parse_single_excel(file_path):
                 claim_cost = val
                 break
 
-    # (2) 을지(내역서)에서 경비 및 물량 일괄 추출
-    ws_eulji = find_sheet_by_keywords(wb, ['을지', '청구내역', '총괄내역', '내역서', '집계표', '물량내역서'])
-    eulji_res = parse_eulji_sheet(ws_eulji)
+    # 2. '집계장' 시트 우선 분석
+    ws_jibgye = find_sheet_by_keywords(wb, ['집계장', '집계'])
+    j_res = parse_jibgye_sheet(ws_jibgye)
 
-    exp_rent = eulji_res["exp_rent"]
-    exp_mgt = eulji_res["exp_mgt"]
-    exp_meals = eulji_res["exp_meals"]
-    dia_now = eulji_res["dia_now"]
-    dia_cum = eulji_res["dia_cum"]
+    dia_now = j_res["dia_now"]
+    dia_cum = j_res["dia_cum"]
+    exp_dorm = j_res["exp_dorm"]
+    exp_meals = j_res["exp_meals"]
 
-    # 개별 전용 탭이 존재하는 경우 보완 확인 (Fallback)
-    if exp_rent == 0.0:
-        ws_r = find_sheet_by_keywords(wb, ['숙소임차', '임차료'])
-        if ws_r: exp_rent = clean_number(ws_r['I2'].value)
-    if exp_mgt == 0.0:
-        ws_m = find_sheet_by_keywords(wb, ['숙소관리', '관리비'])
-        if ws_m: exp_mgt = clean_number(ws_m['I2'].value)
-    if exp_meals == 0.0:
-        ws_meal = find_sheet_by_keywords(wb, ['식대', '식대비용'])
-        if ws_meal: exp_meals = clean_number(ws_meal['I2'].value)
-    if dia_now == 0.0 and dia_cum == 0.0:
-        ws_q = find_sheet_by_keywords(wb, ['물량내역', '물량'])
+    # 집계장에서 0인 경우 개별 시트 폴백(Fallback)
+    if dia_now == 0.0:
+        ws_q = find_sheet_by_keywords(wb, ['물량내역서', 'DIA-INCH'])
         if ws_q:
             dia_now = clean_number(ws_q['J50'].value)
             dia_cum = clean_number(ws_q['L50'].value)
 
-    exp_dorm = exp_rent + exp_mgt
+    if exp_dorm == 0.0:
+        ws_rent = find_sheet_by_keywords(wb, ['숙소임차료', '숙소임차'])
+        ws_mgt = find_sheet_by_keywords(wb, ['숙소관리비', '숙소관리'])
+        r_amt = clean_number(ws_rent['I2'].value) if ws_rent else 0.0
+        m_amt = clean_number(ws_mgt['I2'].value) if ws_mgt else 0.0
+        exp_dorm = r_amt + m_amt
+
+    if exp_meals == 0.0:
+        ws_meal = find_sheet_by_keywords(wb, ['식대비용', '식대'])
+        if ws_meal:
+            exp_meals = clean_number(ws_meal['I2'].value)
+
     exp_total = exp_dorm + exp_meals
 
-    # (3) 인건비(노무비/근로내역) 추출
+    # 3. 인건비 (근로내역 / 노무비명세서)
     craft_data = {
         '배관공': {'공수': 0.0, '금액': 0.0},
         '용접사': {'공수': 0.0, '금액': 0.0},
@@ -230,8 +217,8 @@ def parse_single_excel(file_path):
         "협력업체명": vendor_name,
         "청구월": claim_month,
         "금회_위탁비용": claim_cost,
-        "경비_숙소임차료": exp_rent,
-        "경비_숙소관리비": exp_mgt,
+        "경비_숙소임차료": 0.0,
+        "경비_숙소관리비": 0.0,
         "경비_숙소소계": exp_dorm,
         "경비_식대": exp_meals,
         "경비_총합계": exp_total,
@@ -257,20 +244,13 @@ def main():
         print("[INFO] data/ 폴더에 처리할 기성 파일이 없습니다.")
         return
 
-    # 첫 번째 파일의 실제 시트 구성 확인용 출력
-    try:
-        sample_wb = openpyxl.load_workbook(excel_files[0], data_only=True)
-        print(f"[DEBUG] 샘플 파일 시트 목록 ({os.path.basename(excel_files[0])}): {sample_wb.sheetnames}")
-    except Exception as e:
-        print(f"[DEBUG] 시트 목록 로드 실패: {e}")
-
     print(f"[INFO] 총 {len(excel_files)}개의 기성 파일을 일괄 처리합니다.")
     records = []
     for f in excel_files:
         try:
             rec = parse_single_excel(f)
             records.append(rec)
-            print(f" [성공] {rec['협력업체명']} ({rec['청구월']}): 위탁 {rec['금회_위탁비용']:,}원 | 경비 {rec['경비_총합계']:,}원 | DIA {rec['금회_DIA_수량']} | 공수 {rec['실투입_총공수']} M/D")
+            print(f" [성공] {rec['협력업체명']} ({rec['청구월']}): 위탁 {rec['금회_위탁비용']:,}원 | 경비 {rec['경비_총합계']:,}원 (숙소 {rec['경비_숙소소계']:,} / 식대 {rec['경비_식대']:,}) | DIA {rec['금회_DIA_수량']} | 공수 {rec['실투입_총공수']} M/D")
         except Exception as e:
             print(f" [오류] {f} 파싱 중 예외 발생: {e}")
 
