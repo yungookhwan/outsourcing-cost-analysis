@@ -13,8 +13,8 @@ from google.oauth2.service_account import Credentials
 # --------------------------------------------------------------------------
 def load_any_workbook(file_path):
     """
-    .xlsx 파일은 openpyxl로 직접 로드하고,
-    .xls(구버전) 파일은 xlrd로 시트/셀을 읽어 openpyxl Workbook 객체로 인메모리 변환
+    .xlsx 파일은 openpyxl로 로드하고,
+    .xls(구버전) 파일은 xlrd로 읽어 openpyxl Workbook 객체로 인메모리 변환
     """
     ext = os.path.splitext(file_path)[1].lower()
     
@@ -27,10 +27,9 @@ def load_any_workbook(file_path):
         except ImportError:
             raise ImportError("구버전 .xls 파일을 읽으려면 'xlrd' 라이브러리가 필요합니다. pip install xlrd를 실행해 주세요.")
         
-        # xlrd로 구버전 워크북 오픈 (formatting_info=False로 안전 로드)
         rb = xlrd.open_workbook(file_path, formatting_info=False)
         wb = openpyxl.Workbook()
-        wb.remove(wb.active)  # 기본 생성된 빈 시트 제거
+        wb.remove(wb.active)
 
         for sheet_idx in range(rb.nsheets):
             r_sheet = rb.sheet_by_index(sheet_idx)
@@ -163,7 +162,9 @@ def parse_single_excel(file_path):
     ws_cover = find_sheet_by_keywords(wb, ['표지', '용역청구서표지'])
     ws_gap = find_sheet_by_keywords(wb, ['갑지', '용역청구서(갑지)']) or wb.active
 
-    # 1. PJT명 동적 자동 추출
+    # -------------------------------------------------------------
+    # (1) PJT명 동적 자동 추출
+    # -------------------------------------------------------------
     pjt_name = ""
     if ws_cover and ws_cover['B7'].value:
         pjt_name = str(ws_cover['B7'].value).strip()
@@ -186,33 +187,98 @@ def parse_single_excel(file_path):
         if not pjt_name:
             pjt_name = "일반공사"
 
-    # 2. 협력업체명 동적 자동 추출
+    # -------------------------------------------------------------
+    # (2) PJT NO (프로젝트 번호) 동적 추출 (신규 추가)
+    # -------------------------------------------------------------
+    pjt_no = ""
+    # 1순위: 표지 시트 B8 셀 우선 확인 (표지 B7 PJT명 바로 밑)
+    if ws_cover and ws_cover['B8'].value:
+        cand_no = str(ws_cover['B8'].value).strip()
+        if cand_no and len(cand_no) >= 3 and not any(k in cand_no for k in ['공사', '청구서', '갑지']):
+            pjt_no = cand_no
+
+    # 2순위: 표지 상단 영역에서 'PJT NO', 'PROJECT NO', 'NO.', '코드', '공사번호' 라벨 옆 셀 탐색
+    if not pjt_no and ws_cover:
+        for r in range(5, 15):
+            for c in range(1, 6):
+                lbl = str(ws_cover.cell(r, c).value or '').strip().upper()
+                if any(k in lbl for k in ['PJT NO', 'PROJECT NO', 'PJT_NO', 'NO.', '공사번호', 'PJT번호', '코드']):
+                    val = str(ws_cover.cell(r, c + 1).value or ws_cover.cell(r + 1, c).value or '').strip()
+                    if val and len(val) >= 3:
+                        pjt_no = val
+                        break
+            if pjt_no:
+                break
+
+    # 3순위: 파일명에서 PJT NO 패턴 감지 (예: (S26-001) 또는 P4-PH2 등)
+    if not pjt_no:
+        no_match = re.search(r'[\(（]?([A-Za-z0-9]+-[A-Za-z0-9]+)[\)）]?', file_name)
+        if no_match:
+            pjt_no = no_match.group(1).strip()
+        else:
+            # P4 Ph2 등의 약어 패턴
+            ph_match = re.search(r'(P\d+\s*Ph\d+)', file_name, re.I)
+            pjt_no = ph_match.group(1).strip() if ph_match else pjt_name[:12]
+
+    # -------------------------------------------------------------
+    # (3) 협력업체명 정밀 동적 감지 (왜곡 방지 필터 강화)
+    # -------------------------------------------------------------
     raw_vendor = ""
+    # 1순위: 표지 시트 C15 셀 확인
     if ws_cover and ws_cover['C15'].value:
         raw_vendor = str(ws_cover['C15'].value).strip()
 
-    if not raw_vendor and ws_cover:
-        for r in range(10, 22):
-            for c in range(1, 5):
-                lbl = str(ws_cover.cell(r, c).value or '').strip()
-                if any(k in lbl for k in ['상호', '업체명', '상 호', '협력업체']):
-                    raw_vendor = str(ws_cover.cell(r, c + 1).value or ws_cover.cell(r, c + 2).value or '').strip()
-                    break
-            if raw_vendor:
-                break
+    # 2순위: 표지 및 갑지 라벨 탐색 ('상호', '업체명', '수급인')
+    search_sheets = [s for s in [ws_cover, ws_gap] if s]
+    if not raw_vendor:
+        for ws_target in search_sheets:
+            for r in range(5, 25):
+                for c in range(1, 6):
+                    lbl = str(ws_target.cell(r, c).value or '').strip()
+                    if any(k in lbl for k in ['상호', '업체명', '상 호', '협력업체', '수급인']):
+                        val = str(ws_target.cell(r, c + 1).value or ws_target.cell(r, c + 2).value or '').strip()
+                        if val and not any(k in val for k in ['상호', '성명', '대표']):
+                            raw_vendor = val
+                            break
+                if raw_vendor: break
+            if raw_vendor: break
 
+    # 3순위: 파일명 정밀 분석
     if not raw_vendor:
         clean_fn = re.sub(r'\.(xlsx|xls)$', '', file_name, flags=re.I)
-        parts = clean_fn.split('_')
-        for p in reversed(parts):
-            p_cand = clean_vendor_name(p)
-            if p_cand and not any(k in p_cand.upper() for k in ['R1', 'R2', 'REV', 'FINAL', '청구서', '갑지', '을지', '최종', '기성', '공구']):
-                raw_vendor = p_cand
+        
+        # (A) 괄호 안의 업체명 패턴 우선 검사 (예: 투입비내역서(대성이엔지) -> 대성이엔지)
+        paren_matches = re.findall(r'[\(（]([^\)）]+)[\)）]', clean_fn)
+        for cand in reversed(paren_matches):
+            cand_clean = clean_vendor_name(cand)
+            if cand_clean and not any(k in cand_clean.upper() for k in ['FAB', 'SUP', '공구', '회차', '월', '검토', 'R1', 'R2', 'S26']):
+                raw_vendor = cand_clean
                 break
+
+        # (B) 언더바(_) 분할 후 유효 업체명 탐색
+        if not raw_vendor:
+            parts = clean_fn.split('_')
+            invalid_keywords = [
+                'R1', 'R2', 'REV', 'FINAL', '청구서', '갑지', '을지', '최종', '기성', '공구',
+                '검토', '내역', '투입비', '회차', '정산', '마감', 'PJT', '공사', 'FAB', 'SUP'
+            ]
+            for p in reversed(parts):
+                p_cand = clean_vendor_name(p)
+                # 숫자가 3개 이상 포함되어 있으면 금액/날짜이므로 배제
+                if len(re.findall(r'\d', p_cand)) >= 3:
+                    continue
+                # 제외 키워드 포함 시 배제
+                if any(k in p_cand.upper() for k in invalid_keywords):
+                    continue
+                if len(p_cand) >= 2:
+                    raw_vendor = p_cand
+                    break
 
     vendor_name = clean_vendor_name(raw_vendor)
 
-    # 3. 청구월 (YYYY-MM)
+    # -------------------------------------------------------------
+    # (4) 청구월 (YYYY-MM 형식)
+    # -------------------------------------------------------------
     raw_month = ws_cover['C14'].value if (ws_cover and ws_cover['C14'].value) else file_name
     month_match = re.search(r'(\d{2,4})년?\s*(\d{1,2})월?', str(raw_month))
     if month_match:
@@ -223,7 +289,7 @@ def parse_single_excel(file_path):
     else:
         claim_month = "2026-09"
 
-    # 4. 금회 위탁비용
+    # (5) 금회 위탁비용
     claim_cost = clean_number(ws_gap['D13'].value)
     if claim_cost == 0.0:
         for r in range(10, 20):
@@ -232,7 +298,7 @@ def parse_single_excel(file_path):
                 claim_cost = val
                 break
 
-    # 5. 집계장 시트 분석
+    # (6) 집계장 시트 분석
     ws_jibgye = find_sheet_by_keywords(wb, ['집계장', '집계'])
     j_res = parse_jibgye_sheet(ws_jibgye)
 
@@ -261,7 +327,7 @@ def parse_single_excel(file_path):
 
     exp_total = exp_dorm + exp_meals
 
-    # 6. 인건비 (근로내역 / 노무비명세서)
+    # (7) 인건비 (근로내역 / 노무비명세서)
     craft_data = {
         '배관공': {'공수': 0.0, '금액': 0.0},
         '용접사': {'공수': 0.0, '금액': 0.0},
@@ -303,6 +369,7 @@ def parse_single_excel(file_path):
 
     return {
         "파일명": file_name,
+        "PJT_NO": pjt_no,
         "PJT명": pjt_name,
         "협력업체명": vendor_name,
         "청구월": claim_month,
@@ -343,7 +410,7 @@ def main():
         try:
             rec = parse_single_excel(f)
             records.append(rec)
-            print(f" [성공] [{rec['PJT명']}] {rec['협력업체명']} ({rec['청구월']}): 위탁 {rec['금회_위탁비용']:,}원 | 경비 {rec['경비_총합계']:,}원 | DIA {rec['금회_DIA_수량']} | 공수 {rec['실투입_총공수']} M/D")
+            print(f" [성공] [{rec['PJT_NO']}] {rec['협력업체명']} ({rec['청구월']}): 위탁 {rec['금회_위탁비용']:,}원 | 경비 {rec['경비_총합계']:,}원 | DIA {rec['금회_DIA_수량']} | 공수 {rec['실투입_총공수']} M/D")
         except Exception as e:
             print(f" [오류] {f} 파싱 중 예외 발생: {e}")
 
@@ -352,9 +419,10 @@ def main():
         return
 
     df = pd.DataFrame(records)
-    df = df.sort_values(by=['PJT명', '청구월', '협력업체명'], ascending=[True, True, True])
+    # PJT_NO 기준으로 정렬
+    df = df.sort_values(by=['PJT_NO', '청구월', '협력업체명'], ascending=[True, True, True])
 
-    # GitHub Actions 환경변수
+    # GitHub Actions 환경변수 읽기
     service_account_json = os.environ.get('GCP_SERVICE_ACCOUNT_KEY')
     spreadsheet_id = os.environ.get('SPREADSHEET_ID')
 
