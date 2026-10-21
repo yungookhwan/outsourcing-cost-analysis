@@ -12,10 +12,6 @@ from google.oauth2.service_account import Credentials
 # 0. 파일 포맷(.xlsx / .xls) 통합 로더
 # --------------------------------------------------------------------------
 def load_any_workbook(file_path):
-    """
-    .xlsx 파일은 openpyxl로 로드하고,
-    .xls(구버전) 파일은 xlrd로 읽어 openpyxl Workbook 객체로 인메모리 변환
-    """
     ext = os.path.splitext(file_path)[1].lower()
     
     if ext == '.xlsx':
@@ -50,16 +46,16 @@ def load_any_workbook(file_path):
 # 1. 문자열 정제 및 직종 매핑 헬퍼 함수
 # --------------------------------------------------------------------------
 def clean_vendor_name(name):
-    """(주), ㈜, 주식회사 등의 수식어를 제거하고 순수 상호명만 반환"""
     if not name:
-        return "기타"
+        return ""
     cleaned = str(name).strip()
     cleaned = re.sub(r'[\(（]?[주株式]+[\)）]?', '', cleaned)
     cleaned = cleaned.replace('㈜', '').replace('주식회사', '').strip()
+    # 공종 태그 제거 (FAB, SUP 등)
+    cleaned = re.sub(r'[\(（]?(FAB|SUP|gas|pcw|pwc)[\)）]?', '', cleaned, flags=re.I).strip()
     return cleaned
 
 def clean_number(val):
-    """문자열, 콤마, None 등을 안전한 float 숫자로 변환"""
     if val is None:
         return 0.0
     if isinstance(val, (int, float)):
@@ -71,7 +67,6 @@ def clean_number(val):
     return float(match.group()) if match else 0.0
 
 def map_standard_craft(job_title):
-    """5대 표준 직종 매핑 엔진 (공사/안전/관리보조 -> '관리자' 통합)"""
     title = str(job_title).strip()
     if '배관' in title:
         return '배관공'
@@ -86,7 +81,6 @@ def map_standard_craft(job_title):
     return '기타'
 
 def find_sheet_by_keywords(wb, keywords):
-    """시트 이름에서 공백을 제거하고 키워드 포함 여부로 시트 객체 반환"""
     for name in wb.sheetnames:
         norm_name = re.sub(r'\s+', '', name)
         if any(re.sub(r'\s+', '', kw) in norm_name for kw in keywords):
@@ -97,7 +91,6 @@ def find_sheet_by_keywords(wb, keywords):
 # 2. '집계장' 파싱 엔진 (물량 및 경비 추출)
 # --------------------------------------------------------------------------
 def parse_jibgye_sheet(sheet):
-    """'집계장' 시트에서 WELDING POINT(D/I 수량) 및 숙소/식대 경비 추출"""
     result = {
         "dia_now": 0.0,
         "dia_cum": 0.0,
@@ -113,7 +106,6 @@ def parse_jibgye_sheet(sheet):
     now_amt_col = 7
     cum_amt_col = 8
 
-    # 헤더 행(1~6행)에서 실제 열 위치 동적 매핑
     for r in range(1, 7):
         row_vals = [str(sheet.cell(r, c).value or '').strip() for c in range(1, 15)]
         for c, val in enumerate(row_vals, 1):
@@ -124,27 +116,23 @@ def parse_jibgye_sheet(sheet):
             elif '금회' in clean_v and any(k in clean_v for k in ['기성', '금액']): now_amt_col = c
             elif '누계' in clean_v and any(k in clean_v for k in ['기성', '금액']): cum_amt_col = c
 
-    # 행 단위 데이터 스캔
     for r in range(1, sheet.max_row + 1):
         item_val = str(sheet.cell(r, item_col).value or '').strip()
         unit_val = str(sheet.cell(r, unit_col).value or '').strip()
         row_str = " ".join([str(sheet.cell(r, c).value or '') for c in range(1, 10)])
         clean_row = re.sub(r'\s+', '', row_str)
 
-        # (1) 물량 (WELDING POINT / D/I 수량)
         if 'WELDING' in item_val.upper() or 'D/I' in unit_val.upper() or 'WELDINGPOINT' in clean_row:
             dia_val = clean_number(sheet.cell(r, qty_col).value)
             if dia_val > 0:
                 result["dia_now"] = dia_val
                 result["dia_cum"] = dia_val
 
-        # (2) 숙소 (임대료+관리비)
         if any(k in clean_row for k in ['임대료+관리비', '숙소', '임차료']):
             amt = clean_number(sheet.cell(r, now_amt_col).value)
             if amt > 0:
                 result["exp_dorm"] = amt
 
-        # (3) 식대
         if '식대' in clean_row and '인원' not in clean_row:
             amt = clean_number(sheet.cell(r, now_amt_col).value)
             if amt > 0:
@@ -163,7 +151,39 @@ def parse_single_excel(file_path):
     ws_gap = find_sheet_by_keywords(wb, ['갑지', '용역청구서(갑지)']) or wb.active
 
     # -------------------------------------------------------------
-    # (1) PJT명 동적 자동 추출
+    # (1) PJT_NO 엄격 탐색 (S25-004, S26-001 형식 우선)
+    # -------------------------------------------------------------
+    pjt_no = ""
+    # 1. 표지 상단 영역에서 'S00-000' 형태 정규식 검색
+    if ws_cover:
+        for r in range(1, 15):
+            for c in range(1, 8):
+                val = str(ws_cover.cell(r, c).value or '').strip()
+                s_match = re.search(r'\b(S\d{2}-\d{3,4})\b', val, re.I)
+                if s_match:
+                    pjt_no = s_match.group(1).upper()
+                    break
+            if pjt_no: break
+
+    # 2. 파일명에서 'S00-000' 검색 (예: (S26-001)8월 기성청구서...)
+    if not pjt_no:
+        s_match = re.search(r'[\(（]?(S\d{2}-\d{3,4})[\)）]?', file_name, re.I)
+        if s_match:
+            pjt_no = s_match.group(1).upper()
+
+    # 3. 표지 B8 셀 값 확인 (위 정규식에 안 걸린 일반 번호인 경우)
+    if not pjt_no and ws_cover and ws_cover['B8'].value:
+        cand_b8 = str(ws_cover['B8'].value).strip()
+        if cand_b8 and len(cand_b8) >= 4 and not any(k in cand_b8 for k in ['공사', '청구서', '갑지', '공구']):
+            pjt_no = cand_b8
+
+    # 4. 폴백: 공구/Ph 구분 코드
+    if not pjt_no:
+        ph_match = re.search(r'(P\d+\s*Ph\d+)', file_name, re.I)
+        pjt_no = ph_match.group(1).strip() if ph_match else "기타 PJT"
+
+    # -------------------------------------------------------------
+    # (2) PJT명 동적 추출
     # -------------------------------------------------------------
     pjt_name = ""
     if ws_cover and ws_cover['B7'].value:
@@ -173,11 +193,10 @@ def parse_single_excel(file_path):
         for r in range(1, 15):
             for c in range(1, 6):
                 val = str(ws_cover.cell(r, c).value or '').strip()
-                if any(k in val for k in ['공구', '공사', 'PJT', 'PROJECT']) and len(val) >= 4:
+                if any(k in val for k in ['공구', '공사', 'PJT', 'PROJECT']) and len(val) >= 4 and not re.search(r'^S\d{2}-', val):
                     pjt_name = val
                     break
-            if pjt_name:
-                break
+            if pjt_name: break
 
     if not pjt_name:
         pjt_match = re.search(r'\]_?([^_]+)_[^_]+', file_name)
@@ -188,96 +207,58 @@ def parse_single_excel(file_path):
             pjt_name = "일반공사"
 
     # -------------------------------------------------------------
-    # (2) PJT NO (프로젝트 번호) 동적 추출 (신규 추가)
-    # -------------------------------------------------------------
-    pjt_no = ""
-    # 1순위: 표지 시트 B8 셀 우선 확인 (표지 B7 PJT명 바로 밑)
-    if ws_cover and ws_cover['B8'].value:
-        cand_no = str(ws_cover['B8'].value).strip()
-        if cand_no and len(cand_no) >= 3 and not any(k in cand_no for k in ['공사', '청구서', '갑지']):
-            pjt_no = cand_no
-
-    # 2순위: 표지 상단 영역에서 'PJT NO', 'PROJECT NO', 'NO.', '코드', '공사번호' 라벨 옆 셀 탐색
-    if not pjt_no and ws_cover:
-        for r in range(5, 15):
-            for c in range(1, 6):
-                lbl = str(ws_cover.cell(r, c).value or '').strip().upper()
-                if any(k in lbl for k in ['PJT NO', 'PROJECT NO', 'PJT_NO', 'NO.', '공사번호', 'PJT번호', '코드']):
-                    val = str(ws_cover.cell(r, c + 1).value or ws_cover.cell(r + 1, c).value or '').strip()
-                    if val and len(val) >= 3:
-                        pjt_no = val
-                        break
-            if pjt_no:
-                break
-
-    # 3순위: 파일명에서 PJT NO 패턴 감지 (예: (S26-001) 또는 P4-PH2 등)
-    if not pjt_no:
-        no_match = re.search(r'[\(（]?([A-Za-z0-9]+-[A-Za-z0-9]+)[\)）]?', file_name)
-        if no_match:
-            pjt_no = no_match.group(1).strip()
-        else:
-            # P4 Ph2 등의 약어 패턴
-            ph_match = re.search(r'(P\d+\s*Ph\d+)', file_name, re.I)
-            pjt_no = ph_match.group(1).strip() if ph_match else pjt_name[:12]
-
-    # -------------------------------------------------------------
-    # (3) 협력업체명 정밀 동적 감지 (왜곡 방지 필터 강화)
+    # (3) 협력업체명 정밀 동적 감지 ('기타' 방지 및 상호 복원)
     # -------------------------------------------------------------
     raw_vendor = ""
-    # 1순위: 표지 시트 C15 셀 확인
-    if ws_cover and ws_cover['C15'].value:
-        raw_vendor = str(ws_cover['C15'].value).strip()
-
-    # 2순위: 표지 및 갑지 라벨 탐색 ('상호', '업체명', '수급인')
+    
+    # 1. 표지 및 갑지 셀 전체에서 상호명 검색
     search_sheets = [s for s in [ws_cover, ws_gap] if s]
-    if not raw_vendor:
-        for ws_target in search_sheets:
-            for r in range(5, 25):
-                for c in range(1, 6):
-                    lbl = str(ws_target.cell(r, c).value or '').strip()
-                    if any(k in lbl for k in ['상호', '업체명', '상 호', '협력업체', '수급인']):
-                        val = str(ws_target.cell(r, c + 1).value or ws_target.cell(r, c + 2).value or '').strip()
-                        if val and not any(k in val for k in ['상호', '성명', '대표']):
+    for ws_target in search_sheets:
+        for r in range(5, 25):
+            for c in range(1, 6):
+                lbl = str(ws_target.cell(r, c).value or '').strip()
+                if any(k in lbl for k in ['상호', '업체명', '상 호', '협력업체', '수급인']):
+                    # 우측 1~4열 확인 (셀 병합 대응)
+                    for offset in range(1, 5):
+                        val = clean_vendor_name(str(ws_target.cell(r, c + offset).value or ''))
+                        if val and len(val) >= 2 and not any(k in val for k in ['상호', '성명', '대표', '주식회사']):
                             raw_vendor = val
                             break
-                if raw_vendor: break
+                    if raw_vendor: break
             if raw_vendor: break
+        if raw_vendor: break
 
-    # 3순위: 파일명 정밀 분석
+    # 2. 파일명 괄호 내부 탐색 (예: 투입비내역서(대성이엔지) -> 대성이엔지)
     if not raw_vendor:
         clean_fn = re.sub(r'\.(xlsx|xls)$', '', file_name, flags=re.I)
-        
-        # (A) 괄호 안의 업체명 패턴 우선 검사 (예: 투입비내역서(대성이엔지) -> 대성이엔지)
         paren_matches = re.findall(r'[\(（]([^\)）]+)[\)）]', clean_fn)
         for cand in reversed(paren_matches):
             cand_clean = clean_vendor_name(cand)
-            if cand_clean and not any(k in cand_clean.upper() for k in ['FAB', 'SUP', '공구', '회차', '월', '검토', 'R1', 'R2', 'S26']):
+            if cand_clean and len(cand_clean) >= 2 and not any(k in cand_clean.upper() for k in ['FAB', 'SUP', '공구', '회차', '월', '검토', 'R1', 'R2', 'S25', 'S26']):
                 raw_vendor = cand_clean
                 break
 
-        # (B) 언더바(_) 분할 후 유효 업체명 탐색
-        if not raw_vendor:
-            parts = clean_fn.split('_')
-            invalid_keywords = [
-                'R1', 'R2', 'REV', 'FINAL', '청구서', '갑지', '을지', '최종', '기성', '공구',
-                '검토', '내역', '투입비', '회차', '정산', '마감', 'PJT', '공사', 'FAB', 'SUP'
-            ]
-            for p in reversed(parts):
-                p_cand = clean_vendor_name(p)
-                # 숫자가 3개 이상 포함되어 있으면 금액/날짜이므로 배제
-                if len(re.findall(r'\d', p_cand)) >= 3:
-                    continue
-                # 제외 키워드 포함 시 배제
-                if any(k in p_cand.upper() for k in invalid_keywords):
-                    continue
-                if len(p_cand) >= 2:
-                    raw_vendor = p_cand
-                    break
+    # 3. 파일명 언더바 분할 탐색
+    if not raw_vendor:
+        clean_fn = re.sub(r'\.(xlsx|xls)$', '', file_name, flags=re.I)
+        parts = clean_fn.split('_')
+        invalid_keywords = [
+            'R1', 'R2', 'REV', 'FINAL', '청구서', '갑지', '을지', '최종', '기성', '공구',
+            '검토', '내역', '투입비', '회차', '정산', '마감', 'PJT', '공사', 'FAB', 'SUP', '일반공사'
+        ]
+        for p in reversed(parts):
+            p_cand = clean_vendor_name(p)
+            # 숫자가 3개 이상 포함(금액, 날짜)되거나 무효 키워드면 건너뜀
+            if len(re.findall(r'\d', p_cand)) >= 2 or any(k in p_cand.upper() for k in invalid_keywords):
+                continue
+            if len(p_cand) >= 2:
+                raw_vendor = p_cand
+                break
 
-    vendor_name = clean_vendor_name(raw_vendor)
+    vendor_name = clean_vendor_name(raw_vendor) if raw_vendor else "기타"
 
     # -------------------------------------------------------------
-    # (4) 청구월 (YYYY-MM 형식)
+    # (4) 청구월 (YYYY-MM)
     # -------------------------------------------------------------
     raw_month = ws_cover['C14'].value if (ws_cover and ws_cover['C14'].value) else file_name
     month_match = re.search(r'(\d{2,4})년?\s*(\d{1,2})월?', str(raw_month))
@@ -298,7 +279,7 @@ def parse_single_excel(file_path):
                 claim_cost = val
                 break
 
-    # (6) 집계장 시트 분석
+    # (6) 집계장 분석
     ws_jibgye = find_sheet_by_keywords(wb, ['집계장', '집계'])
     j_res = parse_jibgye_sheet(ws_jibgye)
 
@@ -419,10 +400,8 @@ def main():
         return
 
     df = pd.DataFrame(records)
-    # PJT_NO 기준으로 정렬
     df = df.sort_values(by=['PJT_NO', '청구월', '협력업체명'], ascending=[True, True, True])
 
-    # GitHub Actions 환경변수 읽기
     service_account_json = os.environ.get('GCP_SERVICE_ACCOUNT_KEY')
     spreadsheet_id = os.environ.get('SPREADSHEET_ID')
 
