@@ -8,7 +8,11 @@ import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
 
+# --------------------------------------------------------------------------
+# 1. 문자열 정제 및 직종 매핑 헬퍼 함수
+# --------------------------------------------------------------------------
 def clean_vendor_name(name):
+    """(주), ㈜, 주식회사 등의 수식어를 제거하고 순수 상호명만 반환"""
     if not name:
         return "기타"
     cleaned = str(name).strip()
@@ -17,6 +21,7 @@ def clean_vendor_name(name):
     return cleaned
 
 def clean_number(val):
+    """문자열, 콤마, None 등을 안전한 float 숫자로 변환"""
     if val is None:
         return 0.0
     if isinstance(val, (int, float)):
@@ -28,6 +33,7 @@ def clean_number(val):
     return float(match.group()) if match else 0.0
 
 def map_standard_craft(job_title):
+    """5대 표준 직종 매핑 엔진 (공사/안전/관리보조 -> '관리자' 통합)"""
     title = str(job_title).strip()
     if '배관' in title:
         return '배관공'
@@ -42,12 +48,16 @@ def map_standard_craft(job_title):
     return '기타'
 
 def find_sheet_by_keywords(wb, keywords):
+    """시트 이름에서 공백을 제거하고 키워드 포함 여부로 시트 객체 반환"""
     for name in wb.sheetnames:
         norm_name = re.sub(r'\s+', '', name)
         if any(re.sub(r'\s+', '', kw) in norm_name for kw in keywords):
             return wb[name]
     return None
 
+# --------------------------------------------------------------------------
+# 2. '집계장' 파싱 엔진 (물량 및 경비 추출)
+# --------------------------------------------------------------------------
 def parse_jibgye_sheet(sheet):
     """'집계장' 시트에서 WELDING POINT(D/I 수량) 및 숙소/식대 경비 추출"""
     result = {
@@ -65,7 +75,7 @@ def parse_jibgye_sheet(sheet):
     now_amt_col = 7     # 금회기성 (기본 G열)
     cum_amt_col = 8     # 누계기성 (기본 H열)
 
-    # 1. 헤더 행(1~5행)에서 실제 열 위치 동적 매핑
+    # 헤더 행(1~5행)에서 실제 열 위치 동적 매핑
     for r in range(1, 6):
         row_vals = [str(sheet.cell(r, c).value or '').strip() for c in range(1, 15)]
         for c, val in enumerate(row_vals, 1):
@@ -76,7 +86,7 @@ def parse_jibgye_sheet(sheet):
             elif '금회' in clean_v and any(k in clean_v for k in ['기성', '금액']): now_amt_col = c
             elif '누계' in clean_v and any(k in clean_v for k in ['기성', '금액']): cum_amt_col = c
 
-    # 2. 행 데이터 스캔
+    # 행 단위 데이터 스캔
     for r in range(1, sheet.max_row + 1):
         item_val = str(sheet.cell(r, item_col).value or '').strip()
         unit_val = str(sheet.cell(r, unit_col).value or '').strip()
@@ -104,24 +114,82 @@ def parse_jibgye_sheet(sheet):
 
     return result
 
+# --------------------------------------------------------------------------
+# 3. 개별 엑셀 파일 동적 파싱 엔진
+# --------------------------------------------------------------------------
 def parse_single_excel(file_path):
     wb = openpyxl.load_workbook(file_path, data_only=True)
     file_name = os.path.basename(file_path)
 
-    # 1. 표지 및 메타데이터
     ws_cover = find_sheet_by_keywords(wb, ['표지', '용역청구서표지'])
     ws_gap = find_sheet_by_keywords(wb, ['갑지', '용역청구서(갑지)']) or wb.active
 
-    pjt_name = ws_cover['B7'].value if (ws_cover and ws_cover['B7'].value) else "P4 Ph4 GAS 1공구 마감공사"
+    # -------------------------------------------------------------
+    # (1) 프로젝트명(PJT명) 완전 동적 자동 감지
+    # -------------------------------------------------------------
+    pjt_name = ""
+    # 1순위: 표지 시트 B7 셀 우선 확인
+    if ws_cover and ws_cover['B7'].value:
+        pjt_name = str(ws_cover['B7'].value).strip()
 
-    raw_vendor = ws_cover['C15'].value if (ws_cover and ws_cover['C15'].value) else ""
-    if not raw_vendor:
-        for v in ['대성이엔지', '태성하이텍', '리도시스템']:
-            if v in file_name:
-                raw_vendor = v
+    # 2순위: 표지 상단 1~15행 영역에서 '공사', 'PJT', 'PROJECT', '공구' 키워드가 들어간 실제 셀 탐색
+    if not pjt_name and ws_cover:
+        for r in range(1, 15):
+            for c in range(1, 6):
+                val = str(ws_cover.cell(r, c).value or '').strip()
+                if any(k in val for k in ['공구', '공사', 'PJT', 'PROJECT']) and len(val) >= 4:
+                    pjt_name = val
+                    break
+            if pjt_name:
                 break
+
+    # 3순위: 표지에서 못 찾을 경우 파일명 패턴 파싱 (예: [2026년12월]_P4 Ph4 GAS 1공구_업체명.xlsx)
+    if not pjt_name:
+        pjt_match = re.search(r'\]_?([^_]+)_[^_]+', file_name)
+        if pjt_match:
+            candidate = pjt_match.group(1).strip()
+            if not any(k in candidate for k in ['용역청구서', '청구서', '기성']):
+                pjt_name = candidate
+            else:
+                pjt_name = re.sub(r'용역청구서|청구서|기성', '', candidate).strip()
+        if not pjt_name:
+            pjt_name = "일반공사"
+
+    # -------------------------------------------------------------
+    # (2) 협력업체명 완전 동적 자동 감지 (고정 업체 리스트 제거)
+    # -------------------------------------------------------------
+    raw_vendor = ""
+    # 1순위: 표지 시트 C15 셀 확인
+    if ws_cover and ws_cover['C15'].value:
+        raw_vendor = str(ws_cover['C15'].value).strip()
+
+    # 2순위: 표지 라벨(상호, 업체명, 협력사) 옆 셀 동적 탐색
+    if not raw_vendor and ws_cover:
+        for r in range(10, 22):
+            for c in range(1, 5):
+                lbl = str(ws_cover.cell(r, c).value or '').strip()
+                if any(k in lbl for k in ['상호', '업체명', '상 호', '협력업체']):
+                    raw_vendor = str(ws_cover.cell(r, c + 1).value or ws_cover.cell(r, c + 2).value or '').strip()
+                    break
+            if raw_vendor:
+                break
+
+    # 3순위: 파일명에서 언더바(_) 기준 업체명 동적 추출
+    if not raw_vendor:
+        clean_fn = re.sub(r'\.(xlsx|xls)$', '', file_name, flags=re.I)
+        parts = clean_fn.split('_')
+        for p in reversed(parts):
+            p_cand = clean_vendor_name(p)
+            # 버전, 서식명, 일자 등 제외
+            if p_cand and not any(k in p_cand.upper() for k in ['R1', 'R2', 'REV', 'FINAL', '청구서', '갑지', '을지', '최종', '기성', '공구']):
+                raw_vendor = p_cand
+                break
+
     vendor_name = clean_vendor_name(raw_vendor)
 
+    # -------------------------------------------------------------
+    # (3) 청구월 (YYYY-MM 형식) 추출
+    # -------------------------------------------------------------
     raw_month = ws_cover['C14'].value if (ws_cover and ws_cover['C14'].value) else file_name
     month_match = re.search(r'(\d{2,4})년?\s*(\d{1,2})월?', str(raw_month))
     if month_match:
@@ -132,7 +200,7 @@ def parse_single_excel(file_path):
     else:
         claim_month = "2026-09"
 
-    # 금회 위탁비용
+    # (4) 금회 위탁비용 (갑지 D13 우선, 없으면 D열 탐색)
     claim_cost = clean_number(ws_gap['D13'].value)
     if claim_cost == 0.0:
         for r in range(10, 20):
@@ -141,7 +209,7 @@ def parse_single_excel(file_path):
                 claim_cost = val
                 break
 
-    # 2. '집계장' 시트 우선 분석
+    # (5) '집계장' 시트 우선 분석 (물량 및 경비)
     ws_jibgye = find_sheet_by_keywords(wb, ['집계장', '집계'])
     j_res = parse_jibgye_sheet(ws_jibgye)
 
@@ -152,7 +220,7 @@ def parse_single_excel(file_path):
 
     # 집계장에서 0인 경우 개별 시트 폴백(Fallback)
     if dia_now == 0.0:
-        ws_q = find_sheet_by_keywords(wb, ['물량내역서', 'DIA-INCH'])
+        ws_q = find_sheet_by_keywords(wb, ['물량내역서', 'DIA-INCH', '물량'])
         if ws_q:
             dia_now = clean_number(ws_q['J50'].value)
             dia_cum = clean_number(ws_q['L50'].value)
@@ -171,7 +239,7 @@ def parse_single_excel(file_path):
 
     exp_total = exp_dorm + exp_meals
 
-    # 3. 인건비 (근로내역 / 노무비명세서)
+    # (6) 인건비 (근로내역 / 노무비명세서)
     craft_data = {
         '배관공': {'공수': 0.0, '금액': 0.0},
         '용접사': {'공수': 0.0, '금액': 0.0},
@@ -238,6 +306,9 @@ def parse_single_excel(file_path):
         "실투입_총노무비": total_labor
     }
 
+# --------------------------------------------------------------------------
+# 4. 구글 스프레드시트 적재 메인 실행부
+# --------------------------------------------------------------------------
 def main():
     excel_files = glob.glob('data/*.xlsx') + glob.glob('data/*.xls')
     if not excel_files:
@@ -250,7 +321,7 @@ def main():
         try:
             rec = parse_single_excel(f)
             records.append(rec)
-            print(f" [성공] {rec['협력업체명']} ({rec['청구월']}): 위탁 {rec['금회_위탁비용']:,}원 | 경비 {rec['경비_총합계']:,}원 (숙소 {rec['경비_숙소소계']:,} / 식대 {rec['경비_식대']:,}) | DIA {rec['금회_DIA_수량']} | 공수 {rec['실투입_총공수']} M/D")
+            print(f" [성공] [{rec['PJT명']}] {rec['협력업체명']} ({rec['청구월']}): 위탁 {rec['금회_위탁비용']:,}원 | 경비 {rec['경비_총합계']:,}원 | DIA {rec['금회_DIA_수량']} | 공수 {rec['실투입_총공수']} M/D")
         except Exception as e:
             print(f" [오류] {f} 파싱 중 예외 발생: {e}")
 
@@ -259,8 +330,9 @@ def main():
         return
 
     df = pd.DataFrame(records)
-    df = df.sort_values(by=['청구월', '협력업체명'], ascending=[True, True])
+    df = df.sort_values(by=['PJT명', '청구월', '협력업체명'], ascending=[True, True, True])
 
+    # GitHub Actions 환경변수 읽기
     service_account_json = os.environ.get('GCP_SERVICE_ACCOUNT_KEY')
     spreadsheet_id = os.environ.get('SPREADSHEET_ID')
 
