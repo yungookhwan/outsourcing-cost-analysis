@@ -235,10 +235,9 @@ def parse_single_excel(file_path):
     if not pjt_name:
       pjt_name = "일반공사"
 
-  # (3) 협력업체명 100% 동적 추출 (사전 하드코딩 완전 배제)
+  # (3) 협력업체명 100% 동적 추출
   raw_vendor = ""
 
-  # 1. 엑셀 표지/갑지 내 라벨 기반 검색 (우측 4개 열 및 병합 셀 완벽 스캔)
   search_sheets = [s for s in [ws_cover, ws_gap] if s]
   for ws_target in search_sheets:
     for r in range(5, 25):
@@ -263,7 +262,6 @@ def parse_single_excel(file_path):
     if raw_vendor:
       break
 
-  # 2. 표지에 상호가 없을 경우 파일명 괄호 파싱
   if not raw_vendor:
     clean_fn = re.sub(r"\.(xlsx|xls)$", "", file_name, flags=re.I)
     paren_matches = re.findall(r"[\(（]([^\)）]+)[\)）]", clean_fn)
@@ -291,7 +289,6 @@ def parse_single_excel(file_path):
         raw_vendor = cand_clean
         break
 
-  # 3. 파일명 언더바 분할 파싱
   if not raw_vendor:
     clean_fn = re.sub(r"\.(xlsx|xls)$", "", file_name, flags=re.I)
     parts = clean_fn.split("_")
@@ -345,7 +342,7 @@ def parse_single_excel(file_path):
   else:
     claim_month = "2026-09"
 
-  # (5) 금회 위탁비용 (마이너스이거나 값 부재 시 0.0 처리)
+  # (5) 금회 위탁비용 (마이너스이거나 청구값이 없으면 0.0 처리)
   raw_claim = ws_gap["D13"].value if ws_gap else None
   claim_cost = clean_number(raw_claim)
 
@@ -467,12 +464,12 @@ def parse_single_excel(file_path):
 
 
 # --------------------------------------------------------------------------
-# 4. 전체 데이터 후처리: 동적 상호 통합 및 구글 시트 적재
+# 4. 전체 데이터 후처리 및 구글 시트 안전 병합 적재
 # --------------------------------------------------------------------------
 def main():
   excel_files = glob.glob("data/*.xlsx") + glob.glob("data/*.xls")
   if not excel_files:
-    print("[INFO] data/ 폴더에 처리할 기성 파일이 없습니다.")
+    print("[INFO] data/ 폴더에 새로 처리할 기성 파일이 없습니다.")
     return
 
   print(f"[INFO] 총 {len(excel_files)}개의 기성 파일을 일괄 처리합니다.")
@@ -489,7 +486,6 @@ def main():
     return
 
   # [2-Pass 동적 상호 자동 통합]
-  # 1. 4글자 이상의 정식 풀네임 목록을 동적으로 자동 수집
   distinct_vendors = {
       r["협력업체명"]
       for r in records
@@ -499,7 +495,6 @@ def main():
       [v for v in distinct_vendors if len(v) >= 4], key=len, reverse=True
   )
 
-  # 2. 2~3글자 약칭으로 들어간 업체명을 해당 풀네임으로 자동 치환
   for r in records:
     v = r["협력업체명"]
     if len(v) <= 3 and v != "기타":
@@ -508,16 +503,15 @@ def main():
           r["협력업체명"] = full
           break
     print(
-        f" [완료] [{r['PJT_NO']}] {r['협력업체명']} ({r['청구월']}): 위탁"
+        f" [파싱완료] [{r['PJT_NO']}] {r['협력업체명']} ({r['청구월']}): 위탁"
         f" {r['금회_위탁비용']:,}원 | DIA {r['금회_DIA_수량']}"
     )
 
   df = pd.DataFrame(records)
-  df = df.sort_values(
-      by=["PJT_NO", "청구월", "협력업체명"], ascending=[True, True, True]
-  )
 
-  # 구글 시트 적재
+  # --------------------------------------------------------------------------
+  # 구글 시트 적재: 기존 데이터 누적 유지 + 수기 수정 컬럼 보존
+  # --------------------------------------------------------------------------
   service_account_json = os.environ.get("GCP_SERVICE_ACCOUNT_KEY")
   spreadsheet_id = os.environ.get("SPREADSHEET_ID")
 
@@ -543,13 +537,59 @@ def main():
     sh = gc.open_by_key(spreadsheet_id.strip())
     ws = sh.get_worksheet(0)
 
-    data_to_write = [df.columns.values.tolist()] + df.fillna(0).values.tolist()
+    # 1. 시트에 이미 적재되어 있는 기존 데이터 읽기
+    existing_data = ws.get_all_values()
+
+    if existing_data and len(existing_data) > 1:
+      headers = existing_data[0]
+      existing_df = pd.DataFrame(existing_data[1:], columns=headers)
+
+      key_col = "파일명"
+
+      # 2. 사용자가 스프레드시트에서 수기로 직접 수정한 PJT명, PJT_NO, 협력업체명 보존 매핑 생성
+      user_edits = {}
+      for _, row in existing_df.iterrows():
+        fn = str(row.get(key_col) or "").strip()
+        if fn:
+          user_edits[fn] = {
+              "PJT_NO": row.get("PJT_NO"),
+              "PJT명": row.get("PJT명"),
+              "협력업체명": row.get("협력업체명"),
+          }
+
+      # 새로 파싱한 데이터에 기존 수기 수정 이력이 있다면 최우선 적용
+      for idx, row in df.iterrows():
+        fn = str(row.get(key_col) or "").strip()
+        if fn in user_edits:
+          if user_edits[fn]["PJT_NO"]:
+            df.at[idx, "PJT_NO"] = user_edits[fn]["PJT_NO"]
+          if user_edits[fn]["PJT명"]:
+            df.at[idx, "PJT명"] = user_edits[fn]["PJT명"]
+          if user_edits[fn]["협력업체명"]:
+            df.at[idx, "협력업체명"] = user_edits[fn]["협력업체명"]
+
+      # 3. 파일명 기준 병합 (신규 파일은 누적 추가, 동일 파일 재업로드 시 최신 파싱값으로 갱신)
+      combined_df = pd.concat([existing_df, df], ignore_index=True)
+      final_df = combined_df.drop_duplicates(subset=[key_col], keep="last")
+    else:
+      final_df = df
+
+    # PJT_NO, 청구월 기준 정렬
+    final_df = final_df.sort_values(
+        by=["PJT_NO", "청구월", "협력업체명"], ascending=[True, True, True]
+    )
+
+    # 4. 시트에 안전 적재
+    data_to_write = [final_df.columns.values.tolist()] + final_df.fillna(
+        0
+    ).values.tolist()
     ws.clear()
     ws.update(range_name="A1", values=data_to_write)
     print(
-        f"[SUCCESS] 구글 스프레드시트에 총 {len(df)}개 기성 데이터 덮어쓰기 적재"
-        " 완료!"
+        f"[SUCCESS] 기존 수기 수정값 보존 및 최신 데이터 증분 적재 완료! (총"
+        f" {len(final_df)}건)"
     )
+
   except Exception as e:
     print(f"[ERROR] 구글 시트 적재 실패: {e}")
     sys.exit(1)
